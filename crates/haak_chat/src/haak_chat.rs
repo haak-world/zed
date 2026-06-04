@@ -1,12 +1,15 @@
 use anyhow::Context as _;
+use editor::{Editor, EditorEvent, EditorMode};
 use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{
     actions, div, list, px, Action, App, AsyncWindowContext, Context, Entity, EventEmitter,
     FocusHandle, Focusable, IntoElement, KeyDownEvent, ListAlignment, ListState, ParentElement,
-    Pixels, Render, SharedString, Styled, Task, WeakEntity, Window,
+    Pixels, Render, SharedString, Styled, Subscription, Task, WeakEntity, Window,
 };
+use language::Buffer;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use multi_buffer::MultiBuffer;
 use serde_json::{json, Value};
 use tungstenite::{connect, Message};
 use ui::prelude::*;
@@ -15,7 +18,7 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-actions!(haak_chat, [Toggle, ToggleFocus]);
+actions!(haak_chat, [Toggle, ToggleFocus, Send]);
 
 const HAAK_CHAT_KEY: &str = "HaakChat";
 
@@ -32,12 +35,12 @@ enum ChatEntry {
 // --- Panel ---
 
 pub struct HaakChat {
-    width: Option<Pixels>,
     focus_handle: FocusHandle,
     _workspace: WeakEntity<Workspace>,
     entries: Vec<ChatEntry>,
     list_state: ListState,
-    input_text: String,
+    editor: Entity<Editor>,
+    _editor_subscription: Subscription,
     session_id: Option<String>,
     session_name: Option<String>,
     agent: String,
@@ -60,12 +63,11 @@ impl HaakChat {
 
     fn new(
         _workspace: &mut Workspace,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let workspace_handle = cx.entity().downgrade();
         let (event_tx, event_rx) = mpsc::unbounded::<String>();
-        // Write channel: std::sync because consumed in a blocking thread
         let (write_tx, write_rx) = std::sync::mpsc::channel::<String>();
 
         // Background OS thread: sync WebSocket I/O
@@ -84,28 +86,23 @@ impl HaakChat {
             let create = json!({"type":"session.create","agent":"bala","model":""});
             let _ = ws.send(Message::text(create.to_string()));
 
-            // Non-blocking read so we can interleave with writes
             if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
                 let _ = s.set_nonblocking(true);
             }
 
             loop {
-                // Read server events
                 match ws.read() {
                     Ok(msg) => {
                         if msg.is_text() {
                             let text = msg.to_text().map(|s| s.to_string()).unwrap_or_default();
                             if event_tx.unbounded_send(text).is_err() { break; }
-                        } else if msg.is_close() {
-                            break;
-                        }
+                        } else if msg.is_close() { break; }
                     }
                     Err(tungstenite::Error::Io(ref e))
                         if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(_) => break,
                 }
 
-                // Send any queued user messages
                 while let Ok(payload) = write_rx.try_recv() {
                     let _ = ws.send(Message::text(payload));
                 }
@@ -116,9 +113,26 @@ impl HaakChat {
 
         let ws_task = Task::ready(());
 
-        cx.new(|cx| {
-            let mut event_rx = event_rx;
+        // Create the compose editor
+        let editor = cx.new(|cx| {
+            let buffer = cx.new(|cx| {
+                MultiBuffer::singleton(cx.new(|cx| Buffer::local("", cx)), cx)
+            });
+            let mut ed = Editor::new(
+                EditorMode::AutoHeight { min_lines: 1, max_lines: Some(6) },
+                buffer,
+                None,
+                window,
+                cx,
+            );
+            ed.set_placeholder_text("Write a message…", window, cx);
+            ed
+        });
 
+        cx.new(|cx| {
+            let event_rx = event_rx;
+
+            // Receive server events
             let event_task = cx.spawn(async |this: WeakEntity<HaakChat>, cx| {
                 #[allow(unused_mut)]
                 let mut event_rx = event_rx;
@@ -129,15 +143,25 @@ impl HaakChat {
                 }
             });
 
+            // Subscribe to editor events — detect newline insertion as send trigger
+            let editor_subscription = cx.subscribe(&editor, |this: &mut Self, editor: Entity<Editor>, event: &EditorEvent, cx: &mut Context<Self>| {
+                if let EditorEvent::BufferEdited = event {
+                    let text = editor.read(cx).text(cx);
+                    if text.ends_with('\n') && text.trim().len() > 0 {
+                        this.send_message(cx);
+                    }
+                }
+            });
+
             let list_state = ListState::new(0, ListAlignment::Bottom, px(300.));
 
             Self {
-                width: None,
                 focus_handle: cx.focus_handle(),
                 _workspace: workspace_handle,
                 entries: Vec::new(),
                 list_state,
-                input_text: String::new(),
+                editor,
+                _editor_subscription: editor_subscription,
                 session_id: None,
                 session_name: None,
                 agent: "bala".into(),
@@ -166,7 +190,7 @@ impl HaakChat {
                 if self.agent.is_empty() { self.agent = "bala".into(); }
                 self.model = Self::s(&msg, "model");
                 self.state = "connected".into();
-                let label = format!("Connected as {}", self.agent);
+                let label = format!("Session {} · {}", self.session_name.as_deref().unwrap_or(""), self.agent);
                 self.entries.push(ChatEntry::System { text: SharedString::from(label) });
                 self.rebuild_list(cx);
             }
@@ -245,10 +269,19 @@ impl HaakChat {
     }
 
     fn send_message(&mut self, cx: &mut Context<Self>) {
-        let text = self.input_text.trim().to_string();
+        let text = self.editor.read(cx).text(cx).trim().to_string();
         if text.is_empty() { return; }
+
         self.entries.push(ChatEntry::User { text: SharedString::from(text.clone()) });
-        self.input_text.clear();
+        // Clear the underlying buffer text
+        self.editor.read(cx).buffer().read(cx).as_singleton().map(|buf| {
+            buf.update(cx, |buf, cx| {
+                let len = buf.len();
+                if len > 0 {
+                    buf.edit([(0..len, "")], None, cx);
+                }
+            });
+        });
         self.state = "running".into();
         self.rebuild_list(cx);
 
@@ -262,19 +295,32 @@ impl HaakChat {
         match entry {
             ChatEntry::User { text } => div()
                 .id(ElementId::NamedInteger("msg".into(), ix as u64))
-                .px_4().py_2()
-                .child(div().text_xs().text_color(cx.theme().colors().text_muted).child("you"))
-                .child(div().text_sm().text_color(cx.theme().colors().text).child(text.clone()))
+                .px_4().pt_3().pb_2()
+                .child(
+                    div().text_xs().text_color(cx.theme().colors().text_muted)
+                        .mb_1()
+                        .child("you")
+                )
+                .child(
+                    div().text_sm().text_color(cx.theme().colors().text)
+                        .child(text.clone())
+                )
                 .into_any_element(),
 
             ChatEntry::Assistant { markdown, .. } => {
                 let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
                 div()
                     .id(ElementId::NamedInteger("msg".into(), ix as u64))
-                    .px_4().py_2()
-                    .child(div().text_xs().text_color(cx.theme().colors().terminal_ansi_cyan)
-                        .child(SharedString::from(self.agent.clone())))
-                    .child(div().text_sm().child(MarkdownElement::new(markdown.clone(), style)))
+                    .px_4().pt_3().pb_2()
+                    .child(
+                        div().text_xs().text_color(cx.theme().colors().terminal_ansi_cyan)
+                            .mb_1()
+                            .child(SharedString::from(self.agent.clone()))
+                    )
+                    .child(
+                        div().text_sm()
+                            .child(MarkdownElement::new(markdown.clone(), style))
+                    )
                     .into_any_element()
             }
 
@@ -283,27 +329,33 @@ impl HaakChat {
                     if *is_error { cx.theme().colors().terminal_ansi_red }
                     else { cx.theme().colors().terminal_ansi_green }
                 } else { cx.theme().colors().text_disabled };
-                let dot: &str = if result.is_some() { "●" } else { "○" };
+                let dot: &str = if result.is_some() { "●" } else { "◌" };
                 div()
                     .id(ElementId::NamedInteger("msg".into(), ix as u64))
-                    .px_4().py_1()
-                    .child(div().flex().gap_2()
-                        .child(div().text_xs().text_color(color).child(dot))
-                        .child(div().text_xs().text_color(cx.theme().colors().text_muted).child(name.clone()))
-                        .child(div().text_xs().text_color(cx.theme().colors().text_disabled).child(input_summary.clone())))
+                    .px_4().py_0p5()
+                    .child(
+                        div().flex().gap_2().items_center()
+                            .child(div().text_xs().text_color(color).child(dot))
+                            .child(div().text_xs().text_color(cx.theme().colors().text_muted).child(name.clone()))
+                            .child(div().text_xs().text_color(cx.theme().colors().text_disabled).child(input_summary.clone()))
+                    )
                     .into_any_element()
             }
 
             ChatEntry::System { text } => div()
                 .id(ElementId::NamedInteger("msg".into(), ix as u64))
                 .px_4().py_1()
-                .child(div().text_xs().text_color(cx.theme().colors().text_disabled).italic().child(text.clone()))
+                .child(
+                    div().text_xs().text_color(cx.theme().colors().text_disabled)
+                        .italic()
+                        .child(text.clone())
+                )
                 .into_any_element(),
         }
     }
 }
 
-// --- Trait impls ---
+// --- Panel trait ---
 
 impl Panel for HaakChat {
     fn persistent_name() -> &'static str { "Haak Chat" }
@@ -333,16 +385,25 @@ impl Render for HaakChat {
             _ => cx.theme().colors().terminal_ansi_red,
         };
 
+        // Header
         let header = div()
-            .px_3().py_2().border_b_1().border_color(cx.theme().colors().border)
+            .px_3().py_2()
+            .border_b_1().border_color(cx.theme().colors().border)
             .flex().items_center().gap_2()
             .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(state_color))
-            .child(div().text_sm().text_color(cx.theme().colors().text)
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .child(SharedString::from(self.session_name.clone().unwrap_or_else(|| self.agent.clone()))))
-            .child(div().text_xs().text_color(cx.theme().colors().text_disabled)
-                .child(SharedString::from(self.state.clone())));
+            .child(
+                div().text_sm().text_color(cx.theme().colors().text)
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(SharedString::from(
+                        self.session_name.clone().unwrap_or_else(|| self.agent.clone())
+                    ))
+            )
+            .child(
+                div().text_xs().text_color(cx.theme().colors().text_disabled)
+                    .child(SharedString::from(self.state.clone()))
+            );
 
+        // Message list
         let weak = cx.entity().downgrade();
         let message_list = list(self.list_state.clone(), move |ix, window, cx| {
             weak.upgrade()
@@ -352,46 +413,26 @@ impl Render for HaakChat {
         .flex_1()
         .size_full();
 
-        let input_display = if self.input_text.is_empty() {
-            "Write a message...".to_string()
-        } else {
-            self.input_text.clone()
-        };
-        let input_color = if self.input_text.is_empty() {
-            cx.theme().colors().text_disabled
-        } else {
-            cx.theme().colors().text
-        };
-
-        let input = div()
-            .px_3().py_2().border_t_1().border_color(cx.theme().colors().border)
-            .child(div().px_2().py_1().rounded_md()
-                .bg(cx.theme().colors().editor_background)
-                .text_sm().text_color(input_color)
-                .child(SharedString::from(input_display)));
+        // Compose area with real Editor
+        let compose = div()
+            .px_3().py_2()
+            .border_t_1().border_color(cx.theme().colors().border)
+            .child(
+                div()
+                    .px_2().py_1()
+                    .rounded_md()
+                    .bg(cx.theme().colors().editor_background)
+                    .child(self.editor.clone())
+            );
 
         div()
             .key_context("HaakChat")
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                let ks = &event.keystroke;
-                if ks.key == "enter" && !ks.modifiers.modified() {
-                    this.send_message(cx);
-                } else if ks.key == "backspace" {
-                    this.input_text.pop();
-                    cx.notify();
-                } else if let Some(ch) = &ks.key_char {
-                    if !ch.is_empty() && ch.chars().all(|c| !c.is_control()) {
-                        this.input_text.push_str(ch);
-                        cx.notify();
-                    }
-                }
-            }))
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .flex().flex_col()
             .child(header)
             .child(message_list)
-            .child(input)
+            .child(compose)
     }
 }

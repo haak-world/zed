@@ -143,12 +143,16 @@ impl HaakChat {
                 }
             });
 
-            // Subscribe to editor events — detect newline insertion as send trigger
+            // Subscribe to editor — detect newline as send trigger
             let editor_subscription = cx.subscribe(&editor, |this: &mut Self, editor: Entity<Editor>, event: &EditorEvent, cx: &mut Context<Self>| {
                 if let EditorEvent::BufferEdited = event {
                     let text = editor.read(cx).text(cx);
-                    if text.ends_with('\n') && text.trim().len() > 0 {
-                        this.send_message(cx);
+                    // Enter inserts \n — if text ends with newline, treat as send
+                    if text.ends_with('\n') {
+                        let content = text.trim();
+                        if !content.is_empty() {
+                            this.send_message(cx);
+                        }
                     }
                 }
             });
@@ -413,16 +417,35 @@ impl Render for HaakChat {
         .flex_1()
         .size_full();
 
-        // Compose area with real Editor
+        // Compose area with Editor + Send button
         let compose = div()
             .px_3().py_2()
             .border_t_1().border_color(cx.theme().colors().border)
             .child(
                 div()
-                    .px_2().py_1()
-                    .rounded_md()
-                    .bg(cx.theme().colors().editor_background)
-                    .child(self.editor.clone())
+                    .flex().gap_2().items_end()
+                    .child(
+                        div()
+                            .flex_1()
+                            .px_2().py_1()
+                            .rounded_md()
+                            .bg(cx.theme().colors().editor_background)
+                            .child(self.editor.clone())
+                    )
+                    .child(
+                        div()
+                            .id("send-btn")
+                            .cursor_pointer()
+                            .px_2().py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .text_color(cx.theme().colors().text_muted)
+                            .hover(|s| s.text_color(cx.theme().colors().text))
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.send_message(cx);
+                            }))
+                            .child("send")
+                    )
             );
 
         div()

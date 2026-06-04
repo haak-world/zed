@@ -146,6 +146,7 @@ members = [
     "crates/open_path_prompt",
     "crates/open_router",
     "crates/outline",
+    "crates/haak_agent_server",
     "crates/haak_chat",
     "crates/ontology_panel",
     "crates/outline_panel",
@@ -407,6 +408,7 @@ open_ai = { path = "crates/open_ai" }
 open_path_prompt = { path = "crates/open_path_prompt" }
 open_router = { path = "crates/open_router", features = ["schemars"] }
 outline = { path = "crates/outline" }
+haak_agent_server = { path = "crates/haak_agent_server" }
 haak_chat = { path = "crates/haak_chat" }
 ontology_panel = { path = "crates/ontology_panel" }
 outline_panel = { path = "crates/outline_panel" }

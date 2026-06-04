@@ -8135,6 +8135,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "haak_agent_server"
+version = "0.1.0"
+dependencies = [
+ "acp_thread",
+ "action_log",
+ "agent-client-protocol",
+ "agent_servers",
+ "anyhow",
+ "futures 0.3.32",
+ "gpui",
+ "project",
+ "serde",
+ "serde_json",
+ "tungstenite 0.24.0",
+ "ui",
+ "util",
+ "watch",
+]
+
+[[package]]
 name = "haak_chat"
 version = "0.1.0"
 dependencies = [
